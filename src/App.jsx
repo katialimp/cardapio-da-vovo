@@ -477,7 +477,7 @@ export default function CardapioDaVovoApp() {
       }
 
       const existentes = await sb(
-        `refeicoes?planejamento_id=eq.${plano.id}&select=id,data,tipo,registro:registro_refeicoes(id)`
+        `refeicoes?casa_id=eq.${casa.id}&data=gte.${inicio}&data=lte.${fim}&select=id,data,tipo,planejamento_id,registro:registro_refeicoes(id)`
       );
       const mapExistentes = new Map((existentes || []).map((r) => [`${r.data}_${r.tipo}`, r]));
 
@@ -496,6 +496,9 @@ export default function CardapioDaVovoApp() {
           let refeicaoId;
           if (existente) {
             refeicaoId = existente.id;
+            if (existente.planejamento_id !== plano.id) {
+              await sb(`refeicoes?id=eq.${refeicaoId}`, { method: "PATCH", body: JSON.stringify({ planejamento_id: plano.id }), prefer: "return=minimal" });
+            }
             await sb(`refeicao_preparacoes?refeicao_id=eq.${refeicaoId}`, { method: "DELETE", prefer: "return=minimal" });
           } else {
             const [nova] = await sb("refeicoes", { method: "POST", body: JSON.stringify({ planejamento_id: plano.id, casa_id: casa.id, data, tipo }) });
@@ -541,7 +544,8 @@ export default function CardapioDaVovoApp() {
       await carregarSemana(casa.id);
       await carregarHoje(casa.id);
     } catch (e) {
-      setErrorMsg("Não foi possível gerar a semana agora. Tente novamente.");
+      console.error(e);
+      setErrorMsg(`Não foi possível gerar a semana agora. Detalhe: ${e.message || e}`);
     } finally {
       setGerandoSemana(false);
     }
