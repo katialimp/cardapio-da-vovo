@@ -27,13 +27,14 @@ const PAPEL_LABELS = {
   SALADA: "Salada",
   ACOMPANHAMENTO: "Acompanhamento",
   MASSA: "Massa",
+  SOPA: "Sopa",
   APERITIVO: "Aperitivo",
   SOBREMESA: "Sobremesa",
 };
 
-const PAPEL_ORDEM = ["ARROZ", "LEGUMINOSA", "PROTEINA", "SALADA", "ACOMPANHAMENTO", "MASSA", "APERITIVO", "SOBREMESA"];
+const PAPEL_ORDEM = ["ARROZ", "LEGUMINOSA", "PROTEINA", "SALADA", "ACOMPANHAMENTO", "MASSA", "SOPA", "APERITIVO", "SOBREMESA"];
 
-const SUBTIPO_LABELS = { CARNE: "Carne", FRANGO: "Frango", PEIXE: "Peixe", OUTRO: "Outro" };
+const SUBTIPO_LABELS = { CARNE: "Carne", FRANGO: "Frango", PEIXE: "Peixe", FRUTOS_DO_MAR: "Frutos do mar", OUTRO: "Outro" };
 
 async function sb(path, options = {}) {
   const res = await fetch(`${SUPABASE_URL}/${path}`, {
@@ -229,6 +230,11 @@ export default function CardapioDaVovoApp() {
   const [novoJantar, setNovoJantar] = useState(true);
   const [salvandoPropria, setSalvandoPropria] = useState(false);
 
+  const [combinacoes, setCombinacoes] = useState([]);
+  const [showAddCombinacao, setShowAddCombinacao] = useState(false);
+  const [itensSelecionados, setItensSelecionados] = useState([]);
+  const [salvandoCombinacao, setSalvandoCombinacao] = useState(false);
+
   const carregarRepertorio = useCallback(async (casaId) => {
     const rows = await sb(
       `casa_preparacoes?casa_id=eq.${casaId}&select=id,ativo,preparacao:preparacoes(id,nome,papel,subtipo_proteina,is_biblioteca_global,disponivel_almoco,disponivel_jantar)&order=id`
@@ -237,6 +243,13 @@ export default function CardapioDaVovoApp() {
     const idsNoRepertorio = new Set((rows || []).map((r) => r.preparacao.id));
     const globais = await sb(`preparacoes?is_biblioteca_global=eq.true&select=id,nome,papel,subtipo_proteina`);
     setBibliotecaDisponivel((globais || []).filter((p) => !idsNoRepertorio.has(p.id)));
+  }, []);
+
+  const carregarCombinacoes = useCallback(async (casaId) => {
+    const rows = await sb(
+      `combinacoes?casa_id=eq.${casaId}&select=id,itens:combinacao_itens(preparacao:preparacoes(id,nome))&order=id`
+    );
+    setCombinacoes(rows || []);
   }, []);
 
   const carregarHoje = useCallback(async (casaId) => {
@@ -256,6 +269,7 @@ export default function CardapioDaVovoApp() {
           setCasa(c);
           await carregarRepertorio(c.id);
           await carregarHoje(c.id);
+          await carregarCombinacoes(c.id);
           setView("app");
         } else {
           setView("criar_casa");
@@ -265,7 +279,7 @@ export default function CardapioDaVovoApp() {
         setView("erro");
       }
     })();
-  }, [carregarRepertorio, carregarHoje]);
+  }, [carregarRepertorio, carregarHoje, carregarCombinacoes]);
 
   async function criarCasa() {
     if (criandoCasa) return;
@@ -394,6 +408,36 @@ export default function CardapioDaVovoApp() {
     }
   }
 
+  function toggleItemSelecionado(preparacaoId) {
+    setItensSelecionados((prev) =>
+      prev.includes(preparacaoId) ? prev.filter((id) => id !== preparacaoId) : [...prev, preparacaoId]
+    );
+  }
+
+  async function salvarCombinacao() {
+    if (salvandoCombinacao) return;
+    if (itensSelecionados.length < 2) {
+      setErrorMsg("Escolha pelo menos 2 preparações para formar uma combinação.");
+      return;
+    }
+    setSalvandoCombinacao(true);
+    setErrorMsg("");
+    try {
+      const [nova] = await sb("combinacoes", { method: "POST", body: JSON.stringify({ casa_id: casa.id }) });
+      await sb("combinacao_itens", {
+        method: "POST",
+        body: JSON.stringify(itensSelecionados.map((preparacao_id) => ({ combinacao_id: nova.id, preparacao_id }))),
+      });
+      await carregarCombinacoes(casa.id);
+      setItensSelecionados([]);
+      setShowAddCombinacao(false);
+    } catch (e) {
+      setErrorMsg("Não foi possível salvar essa combinação. Tente novamente.");
+    } finally {
+      setSalvandoCombinacao(false);
+    }
+  }
+
   const repertorioPorPapel = PAPEL_ORDEM.map((papel) => ({
     papel,
     itens: repertorio.filter((r) => r.preparacao.papel === papel),
@@ -482,6 +526,7 @@ export default function CardapioDaVovoApp() {
         {[
           { id: "hoje", label: "Hoje" },
           { id: "preparacoes", label: "Minhas preparações" },
+          { id: "combinacoes", label: "Minhas combinações" },
         ].map((t) => (
           <button
             key={t.id}
@@ -503,7 +548,7 @@ export default function CardapioDaVovoApp() {
             {t.label}
           </button>
         ))}
-        {["Semana", "Histórico", "Config"].map((label) => (
+        {["Semana", "Histórico"].map((label) => (
           <div key={label} style={{ height: 40, padding: "0 16px", borderRadius: 10, border: `1px solid ${colors.border}`, fontSize: 14, color: colors.textMuted, display: "flex", alignItems: "center", opacity: 0.5, whiteSpace: "nowrap" }}>
             {label} <span style={{ fontSize: 11, marginLeft: 6 }}>em breve</span>
           </div>
@@ -629,6 +674,57 @@ export default function CardapioDaVovoApp() {
                   ))}
                 </Card>
               </div>
+            ))}
+          </div>
+        )}
+
+        {tab === "combinacoes" && (
+          <div>
+            <p style={{ color: colors.textMuted, fontSize: 14, margin: "4px 0 14px" }}>
+              O que a sua família costuma comer junto. O gerador vai priorizar essas combinações, sem torná-las obrigatórias.
+            </p>
+
+            <Button
+              variant="secondary"
+              onClick={() => { setShowAddCombinacao((v) => !v); setItensSelecionados([]); }}
+              style={{ marginBottom: 16 }}
+            >
+              + Nova combinação
+            </Button>
+
+            {showAddCombinacao && (
+              <Card>
+                <p style={{ fontWeight: 700, margin: "0 0 10px" }}>Escolha 2 ou mais preparações</p>
+                {repertorio.filter((r) => r.ativo).map((r) => (
+                  <label key={r.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", fontSize: 15 }}>
+                    <input
+                      type="checkbox"
+                      checked={itensSelecionados.includes(r.preparacao.id)}
+                      onChange={() => toggleItemSelecionado(r.preparacao.id)}
+                      style={{ width: 20, height: 20 }}
+                    />
+                    {r.preparacao.nome}
+                    <span style={{ fontSize: 12, color: colors.textMuted }}>({PAPEL_LABELS[r.preparacao.papel]})</span>
+                  </label>
+                ))}
+                <Button onClick={salvarCombinacao} disabled={salvandoCombinacao} style={{ width: "100%", marginTop: 12 }}>
+                  {salvandoCombinacao ? "Salvando..." : "Salvar combinação"}
+                </Button>
+              </Card>
+            )}
+
+            {combinacoes.length === 0 && !showAddCombinacao && (
+              <Card>
+                <p style={{ color: colors.textMuted, margin: 0 }}>Nenhuma combinação cadastrada ainda.</p>
+              </Card>
+            )}
+
+            {combinacoes.map((c) => (
+              <Card key={c.id}>
+                <p style={{ margin: 0, fontWeight: 600, fontSize: 15 }}>
+                  {c.itens.map((it) => it.preparacao.nome).join(" + ")}
+                </p>
+              </Card>
             ))}
           </div>
         )}
