@@ -69,6 +69,20 @@ function addDaysISO(iso, days) {
   return d.toISOString().slice(0, 10);
 }
 
+function inicioDaSemana(iso) {
+  const d = new Date(iso + "T00:00:00");
+  const dow = d.getDay();
+  const diff = dow === 0 ? -6 : 1 - dow;
+  d.setDate(d.getDate() + diff);
+  return d.toISOString().slice(0, 10);
+}
+
+const DIA_LABELS = { 1: "Segunda", 2: "Terça", 3: "Quarta", 4: "Quinta", 5: "Sexta", 6: "Sábado", 0: "Domingo" };
+function labelDoDia(iso) {
+  const d = new Date(iso + "T00:00:00");
+  return `${DIA_LABELS[d.getDay()]}, ${d.getDate()}/${d.getMonth() + 1}`;
+}
+
 function pickRandom(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
@@ -235,6 +249,11 @@ export default function CardapioDaVovoApp() {
   const [itensSelecionados, setItensSelecionados] = useState([]);
   const [salvandoCombinacao, setSalvandoCombinacao] = useState(false);
 
+  const [semana, setSemana] = useState([]);
+  const [gerandoSemana, setGerandoSemana] = useState(false);
+  const [trocandoItem, setTrocandoItem] = useState(null);
+  const [salvandoTroca, setSalvandoTroca] = useState(false);
+
   const carregarRepertorio = useCallback(async (casaId) => {
     const rows = await sb(
       `casa_preparacoes?casa_id=eq.${casaId}&select=id,ativo,preparacao:preparacoes(id,nome,papel,subtipo_proteina,is_biblioteca_global,disponivel_almoco,disponivel_jantar)&order=id`
@@ -260,6 +279,20 @@ export default function CardapioDaVovoApp() {
     setRefeicoesHoje(refs || []);
   }, []);
 
+  const carregarSemana = useCallback(async (casaId) => {
+    const inicio = inicioDaSemana(todayISO());
+    const fim = addDaysISO(inicio, 6);
+    const planos = await sb(`planejamentos?casa_id=eq.${casaId}&semana_inicio=eq.${inicio}&limit=1`);
+    if (!planos || planos.length === 0) {
+      setSemana([]);
+      return;
+    }
+    const refs = await sb(
+      `refeicoes?planejamento_id=eq.${planos[0].id}&select=id,data,tipo,refeicao_preparacoes(id,papel,preparacao:preparacoes(id,nome)),registro:registro_refeicoes(id)&order=data`
+    );
+    setSemana(refs || []);
+  }, []);
+
   useEffect(() => {
     (async () => {
       try {
@@ -270,6 +303,7 @@ export default function CardapioDaVovoApp() {
           await carregarRepertorio(c.id);
           await carregarHoje(c.id);
           await carregarCombinacoes(c.id);
+          await carregarSemana(c.id);
           setView("app");
         } else {
           setView("criar_casa");
@@ -279,7 +313,7 @@ export default function CardapioDaVovoApp() {
         setView("erro");
       }
     })();
-  }, [carregarRepertorio, carregarHoje, carregarCombinacoes]);
+  }, [carregarRepertorio, carregarHoje, carregarCombinacoes, carregarSemana]);
 
   async function criarCasa() {
     if (criandoCasa) return;
@@ -408,6 +442,130 @@ export default function CardapioDaVovoApp() {
     }
   }
 
+  function validarRepertorio() {
+    const faltando = [];
+    for (const [tipo, papeis, filtro] of [
+      ["ALMOCO", casa.estrutura_almoco, "disponivel_almoco"],
+      ["JANTAR", casa.estrutura_jantar, "disponivel_jantar"],
+    ]) {
+      for (const papel of papeis) {
+        const temOpcao = repertorio.some((r) => r.ativo && r.preparacao.papel === papel && r.preparacao[filtro]);
+        if (!temOpcao) faltando.push({ tipo, papel });
+      }
+    }
+    return faltando;
+  }
+
+  async function gerarOuRegenerarSemana() {
+    if (gerandoSemana) return;
+    setErrorMsg("");
+    const faltando = validarRepertorio();
+    if (faltando.length > 0) {
+      const linhas = faltando.map((f) => `${PAPEL_LABELS[f.papel]} (${f.tipo === "ALMOCO" ? "almoço" : "jantar"})`);
+      setErrorMsg(`Não foi possível montar o cardápio completo. Faltam opções válidas para: ${linhas.join(", ")}. Adicione ou ative preparações desses tipos em Minhas Preparações.`);
+      return;
+    }
+    setGerandoSemana(true);
+    try {
+      const inicio = inicioDaSemana(todayISO());
+      const fim = addDaysISO(inicio, 6);
+      let planos = await sb(`planejamentos?casa_id=eq.${casa.id}&semana_inicio=eq.${inicio}&limit=1`);
+      let plano = planos && planos[0];
+      if (!plano) {
+        const [novo] = await sb("planejamentos", { method: "POST", body: JSON.stringify({ casa_id: casa.id, semana_inicio: inicio, semana_fim: fim }) });
+        plano = novo;
+      }
+
+      const existentes = await sb(
+        `refeicoes?planejamento_id=eq.${plano.id}&select=id,data,tipo,registro:registro_refeicoes(id)`
+      );
+      const mapExistentes = new Map((existentes || []).map((r) => [`${r.data}_${r.tipo}`, r]));
+
+      const usadosPorPapel = {};
+
+      for (let i = 0; i < 7; i++) {
+        const data = addDaysISO(inicio, i);
+        for (const [tipo, papeis, filtro] of [
+          ["ALMOCO", casa.estrutura_almoco, "disponivel_almoco"],
+          ["JANTAR", casa.estrutura_jantar, "disponivel_jantar"],
+        ]) {
+          const chave = `${data}_${tipo}`;
+          const existente = mapExistentes.get(chave);
+          if (existente && existente.registro && existente.registro.length > 0) continue; // preserva histórico
+
+          let refeicaoId;
+          if (existente) {
+            refeicaoId = existente.id;
+            await sb(`refeicao_preparacoes?refeicao_id=eq.${refeicaoId}`, { method: "DELETE", prefer: "return=minimal" });
+          } else {
+            const [nova] = await sb("refeicoes", { method: "POST", body: JSON.stringify({ planejamento_id: plano.id, casa_id: casa.id, data, tipo }) });
+            refeicaoId = nova.id;
+          }
+
+          const escolhas = {};
+          if (combinacoes.length > 0 && Math.random() < 0.5) {
+            const candidatasCombo = combinacoes.filter((c) =>
+              c.itens.every((it) => {
+                const rep = repertorio.find((r) => r.preparacao.id === it.preparacao.id);
+                return rep && rep.ativo && papeis.includes(rep.preparacao.papel) && rep.preparacao[filtro];
+              })
+            );
+            if (candidatasCombo.length > 0) {
+              const combo = pickRandom(candidatasCombo);
+              for (const it of combo.itens) {
+                const rep = repertorio.find((r) => r.preparacao.id === it.preparacao.id);
+                escolhas[rep.preparacao.papel] = rep.preparacao;
+              }
+            }
+          }
+
+          for (const papel of papeis) {
+            if (escolhas[papel]) continue;
+            const candidatos = repertorio
+              .filter((r) => r.ativo && r.preparacao.papel === papel && r.preparacao[filtro])
+              .map((r) => r.preparacao);
+            const usados = usadosPorPapel[papel] || new Set();
+            const semRepetir = candidatos.filter((c) => !usados.has(c.id));
+            const escolhida = pickRandom(semRepetir.length > 0 ? semRepetir : candidatos);
+            escolhas[papel] = escolhida;
+            usadosPorPapel[papel] = new Set([...usados, escolhida.id]);
+          }
+
+          const linhas = Object.entries(escolhas).map(([papel, prep]) => ({ refeicao_id: refeicaoId, preparacao_id: prep.id, papel }));
+          if (linhas.length > 0) {
+            await sb("refeicao_preparacoes", { method: "POST", body: JSON.stringify(linhas) });
+          }
+        }
+      }
+
+      await carregarSemana(casa.id);
+      await carregarHoje(casa.id);
+    } catch (e) {
+      setErrorMsg("Não foi possível gerar a semana agora. Tente novamente.");
+    } finally {
+      setGerandoSemana(false);
+    }
+  }
+
+  async function trocarPreparacao(refeicaoPreparacaoId, novaPreparacaoId) {
+    if (salvandoTroca) return;
+    setSalvandoTroca(true);
+    try {
+      await sb(`refeicao_preparacoes?id=eq.${refeicaoPreparacaoId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ preparacao_id: novaPreparacaoId }),
+        prefer: "return=minimal",
+      });
+      await carregarSemana(casa.id);
+      await carregarHoje(casa.id);
+      setTrocandoItem(null);
+    } catch (e) {
+      setErrorMsg("Não foi possível trocar essa preparação agora.");
+    } finally {
+      setSalvandoTroca(false);
+    }
+  }
+
   function toggleItemSelecionado(preparacaoId) {
     setItensSelecionados((prev) =>
       prev.includes(preparacaoId) ? prev.filter((id) => id !== preparacaoId) : [...prev, preparacaoId]
@@ -525,6 +683,7 @@ export default function CardapioDaVovoApp() {
       <div style={{ display: "flex", gap: 8, padding: "0.5rem 1.25rem 1rem", overflowX: "auto" }}>
         {[
           { id: "hoje", label: "Hoje" },
+          { id: "semana", label: "Semana" },
           { id: "preparacoes", label: "Minhas preparações" },
           { id: "combinacoes", label: "Minhas combinações" },
         ].map((t) => (
@@ -548,7 +707,7 @@ export default function CardapioDaVovoApp() {
             {t.label}
           </button>
         ))}
-        {["Semana", "Histórico"].map((label) => (
+        {["Histórico"].map((label) => (
           <div key={label} style={{ height: 40, padding: "0 16px", borderRadius: 10, border: `1px solid ${colors.border}`, fontSize: 14, color: colors.textMuted, display: "flex", alignItems: "center", opacity: 0.5, whiteSpace: "nowrap" }}>
             {label} <span style={{ fontSize: 11, marginLeft: 6 }}>em breve</span>
           </div>
@@ -573,6 +732,96 @@ export default function CardapioDaVovoApp() {
                     <span style={{ fontWeight: 600, fontSize: 15 }}>{rp.preparacao?.nome}</span>
                   </div>
                 ))}
+              </Card>
+            ))}
+          </div>
+        )}
+
+        {tab === "semana" && (
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", margin: "4px 0 14px" }}>
+              <p style={{ color: colors.textMuted, fontSize: 14, margin: 0 }}>
+                Toque em qualquer preparação pra trocar só ela.
+              </p>
+            </div>
+            <Button onClick={gerarOuRegenerarSemana} disabled={gerandoSemana} style={{ width: "100%", marginBottom: 16 }}>
+              {gerandoSemana ? "Gerando..." : semana.length > 0 ? "Gerar semana novamente" : "Gerar cardápio da semana"}
+            </Button>
+
+            {semana.length === 0 && !gerandoSemana && (
+              <Card>
+                <p style={{ color: colors.textMuted, margin: 0 }}>Nenhum cardápio gerado para esta semana ainda.</p>
+              </Card>
+            )}
+
+            {semana.map((r) => (
+              <Card key={r.id}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 10 }}>
+                  <p style={{ fontWeight: 700, margin: 0, fontSize: 16 }}>{labelDoDia(r.data)}</p>
+                  <span style={{ fontSize: 13, color: colors.textMuted }}>{r.tipo === "ALMOCO" ? "Almoço" : "Jantar"}</span>
+                </div>
+                {r.registro && r.registro.length > 0 && (
+                  <div style={{ fontSize: 12, color: colors.secondaryText, marginBottom: 8 }}>já registrado — protegido de alterações</div>
+                )}
+                {r.refeicao_preparacoes.map((rp, i) => {
+                  const filtro = r.tipo === "ALMOCO" ? "disponivel_almoco" : "disponivel_jantar";
+                  const alternativas = repertorio.filter(
+                    (rep) => rep.ativo && rep.preparacao.papel === rp.papel && rep.preparacao[filtro] && rep.preparacao.id !== rp.preparacao?.id
+                  );
+                  const bloqueado = r.registro && r.registro.length > 0;
+                  return (
+                    <div key={rp.id} style={{ borderTop: i > 0 ? `1px solid ${colors.border}` : "none", padding: "8px 0" }}>
+                      <button
+                        onClick={() => !bloqueado && setTrocandoItem(trocandoItem === rp.id ? null : rp.id)}
+                        disabled={bloqueado}
+                        style={{
+                          width: "100%",
+                          display: "flex",
+                          justifyContent: "space-between",
+                          background: "none",
+                          border: "none",
+                          padding: 0,
+                          cursor: bloqueado ? "default" : "pointer",
+                          textAlign: "left",
+                        }}
+                      >
+                        <span style={{ color: colors.textMuted, fontSize: 14 }}>{PAPEL_LABELS[rp.papel]}</span>
+                        <span style={{ fontWeight: 600, fontSize: 15, color: bloqueado ? colors.text : colors.primaryText }}>
+                          {rp.preparacao?.nome} {!bloqueado && "✎"}
+                        </span>
+                      </button>
+                      {trocandoItem === rp.id && (
+                        <div style={{ marginTop: 8, paddingLeft: 8, borderLeft: `2px solid ${colors.border}` }}>
+                          {alternativas.length === 0 && (
+                            <p style={{ fontSize: 13, color: colors.textMuted }}>Nenhuma outra opção de {PAPEL_LABELS[rp.papel]} disponível.</p>
+                          )}
+                          {alternativas.map((alt) => (
+                            <button
+                              key={alt.id}
+                              disabled={salvandoTroca}
+                              onClick={() => trocarPreparacao(rp.id, alt.preparacao.id)}
+                              style={{
+                                display: "block",
+                                width: "100%",
+                                textAlign: "left",
+                                background: colors.secondarySoft,
+                                border: "none",
+                                borderRadius: 8,
+                                padding: "10px 12px",
+                                marginBottom: 6,
+                                fontSize: 14,
+                                color: colors.secondaryText,
+                                cursor: "pointer",
+                              }}
+                            >
+                              {alt.preparacao.nome}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </Card>
             ))}
           </div>
